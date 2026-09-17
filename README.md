@@ -25,6 +25,13 @@ Review catalog quality, including same-name conflicts, merged source provenance,
 
 	D:/Apps/Python/Python313/python.exe main.py --cache catalog.json quality
 
+Create and inspect a user configuration file, then report sources or export the existing catalog:
+
+	D:/Apps/Python/Python313/python.exe main.py config init
+	D:/Apps/Python/Python313/python.exe main.py config show
+	D:/Apps/Python/Python313/python.exe main.py sources
+	D:/Apps/Python/Python313/python.exe main.py export --format csv --output executables.csv
+
 Use `--json` before the command for structured output. `scan` recognizes `.exe`, `.com`, `.bat`, `.cmd`, and `.ps1` by default; override this with `--extensions .exe,.cmd`.
 
 ## Behavior
@@ -38,3 +45,9 @@ Directory roots are scanned concurrently with a bounded thread pool. Inaccessibl
 Records with the same canonical path are consolidated and retain every source/root that found them. Executables with the same normalized name but different paths are reported by `quality`; a `.cmd`, `.bat`, or `.ps1` candidate with the same name is labeled only as a possible wrapper or shim, never selected automatically.
 
 When `--root` is supplied, only the listed custom roots are scanned. Without `--root`, the built-in Windows source locations are used.
+
+## Configuration And Reporting
+
+The default configuration path is `%LOCALAPPDATA%\ExecutableManager\config.json`. Run `config init` to create it. The file configures the default catalog path, whether built-in locations are scanned, enabled built-in source labels, configured custom roots, custom-root recursion, worker count, and executable extensions. Command-line `--cache`, `--workers`, and `--extensions` override configuration values.
+
+`sources` reports the catalog's source labels, roots, discovered-record counts, and diagnostics. `export` writes the current catalog to standard output or a specified JSON/CSV file, including each record's current filesystem status and merged provenance.

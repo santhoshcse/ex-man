@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ from typing import Callable, Iterable, TypedDict, cast
 
 
 CATALOG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 1
 DEFAULT_EXTENSIONS = (".exe", ".com", ".bat", ".cmd", ".ps1")
 WRAPPER_EXTENSIONS = frozenset((".bat", ".cmd", ".ps1"))
 
@@ -48,6 +50,17 @@ class Catalog(TypedDict):
     diagnostics: list[dict[str, str]]
 
 
+class AppConfig(TypedDict):
+    schema_version: int
+    catalog_path: str
+    include_default_sources: bool
+    enabled_sources: list[str]
+    custom_roots: list[str]
+    recursive_custom_roots: bool
+    workers: int
+    extensions: list[str]
+
+
 @dataclass(frozen=True)
 class RootSpec:
     path: Path
@@ -70,6 +83,74 @@ def default_cache_path() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     base_directory = Path(local_app_data) if local_app_data else Path.home() / ".local" / "share"
     return base_directory / "ExecutableManager" / "catalog.json"
+
+
+def default_config_path() -> Path:
+    return default_cache_path().with_name("config.json")
+
+
+def default_workers() -> int:
+    return min(8, (os.cpu_count() or 1) + 2)
+
+
+def default_configuration() -> AppConfig:
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "catalog_path": str(default_cache_path()),
+        "include_default_sources": True,
+        "enabled_sources": [],
+        "custom_roots": [],
+        "recursive_custom_roots": True,
+        "workers": default_workers(),
+        "extensions": list(DEFAULT_EXTENSIONS),
+    }
+
+
+def validate_configuration(value: object) -> AppConfig:
+    if not isinstance(value, dict):
+        raise ValueError("configuration must be a JSON object")
+    if value.get("schema_version") != CONFIG_SCHEMA_VERSION:
+        raise ValueError(f"configuration has an unsupported schema: {value.get('schema_version')}")
+
+    required_strings = ("catalog_path",)
+    required_lists = ("enabled_sources", "custom_roots", "extensions")
+    for key in required_strings:
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise ValueError(f"configuration field '{key}' must be a non-empty string")
+    for key in required_lists:
+        if not isinstance(value.get(key), list) or not all(isinstance(item, str) for item in value[key]):
+            raise ValueError(f"configuration field '{key}' must be a list of strings")
+    for key in ("include_default_sources", "recursive_custom_roots"):
+        if not isinstance(value.get(key), bool):
+            raise ValueError(f"configuration field '{key}' must be a boolean")
+    if not isinstance(value.get("workers"), int) or isinstance(value["workers"], bool) or value["workers"] < 1:
+        raise ValueError("configuration field 'workers' must be a positive integer")
+
+    parse_extensions(",".join(cast(list[str], value["extensions"])))
+    return cast(AppConfig, value)
+
+
+def write_json_atomically(path: Path, content: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as temporary_file:
+        json.dump(content, temporary_file, indent=2)
+        temporary_file.write("\n")
+        temporary_path = Path(temporary_file.name)
+    temporary_path.replace(path)
+
+
+def write_configuration(config_path: Path, configuration: AppConfig) -> None:
+    write_json_atomically(config_path, configuration)
+
+
+def load_configuration(config_path: Path) -> AppConfig:
+    if not config_path.exists():
+        return default_configuration()
+    try:
+        with config_path.open(encoding="utf-8") as config_file:
+            return validate_configuration(json.load(config_file))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"configuration is not valid JSON: {config_path}") from error
 
 
 def canonical_path(path: Path) -> str:
@@ -237,12 +318,7 @@ def write_catalog(
         "records": records,
         "diagnostics": diagnostics,
     }
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile("w", encoding="utf-8", dir=cache_path.parent, delete=False) as temporary_file:
-        json.dump(catalog, temporary_file, indent=2)
-        temporary_file.write("\n")
-        temporary_path = Path(temporary_file.name)
-    temporary_path.replace(cache_path)
+    write_json_atomically(cache_path, catalog)
     return catalog
 
 
@@ -465,12 +541,31 @@ def print_quality_report(report: dict[str, object], as_json: bool) -> None:
         print(f"\n{stale['status'].title()}: {stale['path']}")
 
 
+def configured_root_specs(configuration: AppConfig, command_roots: list[str] | None, no_default_sources: bool) -> list[RootSpec]:
+    if command_roots:
+        return unique_root_specs([RootSpec(Path(root), "Custom", True) for root in command_roots])
+
+    roots: list[RootSpec] = []
+    if configuration["include_default_sources"] and not no_default_sources:
+        enabled_sources = {source.casefold() for source in configuration["enabled_sources"]}
+        for root in default_root_specs():
+            if not enabled_sources or root.source.casefold() in enabled_sources:
+                roots.append(root)
+    roots.extend(
+        RootSpec(Path(root), "Custom", configuration["recursive_custom_roots"])
+        for root in configuration["custom_roots"]
+    )
+    return unique_root_specs(roots)
+
+
 def refresh_catalog(arguments: argparse.Namespace) -> tuple[Catalog, int]:
-    roots = [RootSpec(Path(root), "Custom", True) for root in arguments.root] if arguments.root else default_root_specs()
-    unique_roots = unique_root_specs(roots)
-    records, diagnostics = scan_roots(unique_roots, arguments.extensions, arguments.workers)
+    configuration = cast(AppConfig, arguments.configuration)
+    roots = configured_root_specs(configuration, arguments.root, arguments.no_default_sources)
+    workers = arguments.workers if arguments.workers is not None else configuration["workers"]
+    extensions = arguments.extensions if arguments.extensions is not None else tuple(configuration["extensions"])
+    records, diagnostics = scan_roots(roots, extensions, workers)
     catalog = write_catalog(arguments.cache, records, diagnostics)
-    return catalog, len(unique_roots)
+    return catalog, len(roots)
 
 
 def command_scan(arguments: argparse.Namespace) -> int:
@@ -512,24 +607,123 @@ def command_quality(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def source_report(catalog: Catalog) -> dict[str, object]:
+    source_details: dict[str, dict[str, object]] = {}
+    for record in catalog["records"]:
+        for provenance in record["sources"]:
+            detail = source_details.setdefault(
+                provenance["source"],
+                {"source": provenance["source"], "records": 0, "roots": set(), "diagnostics": 0},
+            )
+            detail["records"] = cast(int, detail["records"]) + 1
+            cast(set[str], detail["roots"]).add(provenance["root"])
+    for diagnostic in catalog["diagnostics"]:
+        source = diagnostic.get("source", "Unknown")
+        detail = source_details.setdefault(source, {"source": source, "records": 0, "roots": set(), "diagnostics": 0})
+        detail["diagnostics"] = cast(int, detail["diagnostics"]) + 1
+
+    sources = []
+    for detail in source_details.values():
+        sources.append(
+            {
+                "source": detail["source"],
+                "records": detail["records"],
+                "roots": sorted(cast(set[str], detail["roots"]), key=str.casefold),
+                "diagnostics": detail["diagnostics"],
+            }
+        )
+    return {"scanned_at": catalog["scanned_at"], "sources": sorted(sources, key=lambda detail: str(detail["source"]).casefold())}
+
+
+def command_sources(arguments: argparse.Namespace) -> int:
+    report = source_report(load_catalog(arguments.cache))
+    if arguments.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    print(f"Catalog scanned: {report['scanned_at']}")
+    for source in cast(list[dict[str, object]], report["sources"]):
+        print(f"{source['source']}: {source['records']} record(s), {source['diagnostics']} diagnostic(s)")
+        for root in cast(list[str], source["roots"]):
+            print(f"  {root}")
+    return 0
+
+
+def export_rows(records: list[ExecutableRecord]) -> list[dict[str, str]]:
+    return [
+        {
+            "id": record["id"],
+            "name": record["name"],
+            "filename": record["filename"],
+            "path": record["path"],
+            "extension": record["extension"],
+            "status": record_status(record),
+            "sources": "; ".join(provenance["source"] for provenance in record["sources"]),
+            "source_roots": "; ".join(provenance["root"] for provenance in record["sources"]),
+        }
+        for record in records
+    ]
+
+
+def command_export(arguments: argparse.Namespace) -> int:
+    rows = export_rows(load_catalog(arguments.cache)["records"])
+    if arguments.format == "json":
+        output = json.dumps(rows, indent=2) + "\n"
+        if arguments.output is None:
+            print(output, end="")
+        else:
+            write_json_atomically(arguments.output, rows)
+    else:
+        if arguments.output is None:
+            writer = csv.DictWriter(sys.stdout, fieldnames=list(rows[0]) if rows else ["id", "name", "filename", "path", "extension", "status", "sources", "source_roots"])
+            writer.writeheader()
+            writer.writerows(rows)
+        else:
+            arguments.output.parent.mkdir(parents=True, exist_ok=True)
+            with arguments.output.open("w", encoding="utf-8", newline="") as output_file:
+                writer = csv.DictWriter(output_file, fieldnames=list(rows[0]) if rows else ["id", "name", "filename", "path", "extension", "status", "sources", "source_roots"])
+                writer.writeheader()
+                writer.writerows(rows)
+    return 0
+
+
+def command_config(arguments: argparse.Namespace) -> int:
+    if arguments.config_action == "init":
+        if arguments.config.exists() and not arguments.force:
+            print(f"Configuration already exists: {arguments.config}. Use --force to replace it.", file=sys.stderr)
+            return 1
+        write_configuration(arguments.config, default_configuration())
+        print(f"Created configuration: {arguments.config}")
+        return 0
+
+    configuration = cast(AppConfig, arguments.configuration)
+    if arguments.config_action == "show":
+        print(json.dumps(configuration, indent=2))
+        return 0
+    print(f"Configuration is valid: {arguments.config}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Discover Windows executables and query a local catalog.")
-    parser.add_argument("--cache", type=Path, default=default_cache_path(), help="catalog JSON path")
+    parser.add_argument("--cache", type=Path, help="catalog JSON path; overrides configuration")
+    parser.add_argument("--config", type=Path, default=default_config_path(), help="configuration JSON path")
     parser.add_argument("--json", action="store_true", help="emit JSON")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = subparsers.add_parser("scan", help="scan executable locations and update the catalog")
-    scan_parser.add_argument("--root", action="append", default=[], help="custom root to scan recursively; repeatable")
-    scan_parser.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 1) + 2), help="maximum scan workers")
-    scan_parser.add_argument("--extensions", type=parse_extensions, default=DEFAULT_EXTENSIONS, help="comma-separated executable extensions")
+    scan_parser.add_argument("--root", action="append", help="custom root to scan recursively; repeatable")
+    scan_parser.add_argument("--no-default-sources", action="store_true", help="skip configured built-in source locations")
+    scan_parser.add_argument("--workers", type=int, help="maximum scan workers; overrides configuration")
+    scan_parser.add_argument("--extensions", type=parse_extensions, help="comma-separated executable extensions; overrides configuration")
     scan_parser.set_defaults(handler=command_scan)
 
     find_parser = subparsers.add_parser("find", help="search the catalog by executable name")
     find_parser.add_argument("query", help="case-insensitive substring to search")
     find_parser.add_argument("--fresh", action="store_true", help="scan before searching")
-    find_parser.add_argument("--root", action="append", default=[], help="custom root for --fresh; repeatable")
-    find_parser.add_argument("--workers", type=int, default=min(8, (os.cpu_count() or 1) + 2), help="maximum scan workers for --fresh")
-    find_parser.add_argument("--extensions", type=parse_extensions, default=DEFAULT_EXTENSIONS, help="extensions for --fresh")
+    find_parser.add_argument("--root", action="append", help="custom root for --fresh; repeatable")
+    find_parser.add_argument("--no-default-sources", action="store_true", help="skip configured built-in source locations for --fresh")
+    find_parser.add_argument("--workers", type=int, help="maximum scan workers for --fresh; overrides configuration")
+    find_parser.add_argument("--extensions", type=parse_extensions, help="extensions for --fresh; overrides configuration")
     find_parser.add_argument("--source", help="only search one source label")
     find_parser.add_argument("--extension", help="only search one extension, such as .exe")
     find_parser.set_defaults(handler=command_find)
@@ -540,6 +734,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     quality_parser = subparsers.add_parser("quality", help="report catalog collisions, provenance, and stale records")
     quality_parser.set_defaults(handler=command_quality)
+
+    sources_parser = subparsers.add_parser("sources", help="report catalog source coverage and diagnostics")
+    sources_parser.set_defaults(handler=command_sources)
+
+    export_parser = subparsers.add_parser("export", help="export catalog records as JSON or CSV")
+    export_parser.add_argument("--format", choices=("json", "csv"), default="json", help="export format")
+    export_parser.add_argument("--output", type=Path, help="destination file; writes to standard output when omitted")
+    export_parser.set_defaults(handler=command_export)
+
+    config_parser = subparsers.add_parser("config", help="initialize, display, or validate configuration")
+    config_actions = config_parser.add_subparsers(dest="config_action", required=True)
+    config_init_parser = config_actions.add_parser("init", help="create a default configuration file")
+    config_init_parser.add_argument("--force", action="store_true", help="replace an existing configuration file")
+    config_init_parser.set_defaults(handler=command_config)
+    config_show_parser = config_actions.add_parser("show", help="display the effective configuration")
+    config_show_parser.set_defaults(handler=command_config)
+    config_validate_parser = config_actions.add_parser("validate", help="validate the configuration file")
+    config_validate_parser.set_defaults(handler=command_config)
     return parser
 
 
@@ -547,6 +759,11 @@ def main() -> int:
     parser = build_parser()
     arguments = parser.parse_args()
     try:
+        if arguments.command == "config" and arguments.config_action == "init":
+            return arguments.handler(arguments)
+        configuration = load_configuration(arguments.config)
+        arguments.configuration = configuration
+        arguments.cache = arguments.cache or Path(configuration["catalog_path"])
         return arguments.handler(arguments)
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
