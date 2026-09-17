@@ -16,14 +16,34 @@ from tempfile import NamedTemporaryFile
 from typing import Iterable, TypedDict, cast
 
 
-CATALOG_SCHEMA_VERSION = 1
+CATALOG_SCHEMA_VERSION = 2
 DEFAULT_EXTENSIONS = (".exe", ".com", ".bat", ".cmd", ".ps1")
+WRAPPER_EXTENSIONS = frozenset((".bat", ".cmd", ".ps1"))
+
+
+class Provenance(TypedDict):
+    source: str
+    root: str
+
+
+class ExecutableRecord(TypedDict):
+    id: str
+    name: str
+    normalized_name: str
+    filename: str
+    path: str
+    extension: str
+    discovered_at: str
+    size: int
+    modified_at: str
+    modified_ns: int
+    sources: list[Provenance]
 
 
 class Catalog(TypedDict):
     schema_version: int
     scanned_at: str
-    records: list[dict[str, object]]
+    records: list[ExecutableRecord]
     diagnostics: list[dict[str, str]]
 
 
@@ -118,7 +138,7 @@ def default_root_specs() -> list[RootSpec]:
     return unique_root_specs(roots)
 
 
-def build_record(path: Path, root: RootSpec, discovered_at: str) -> dict[str, object]:
+def build_record(path: Path, root: RootSpec, discovered_at: str) -> ExecutableRecord:
     stat_result = path.stat()
     return {
         "id": executable_id(path),
@@ -127,16 +147,16 @@ def build_record(path: Path, root: RootSpec, discovered_at: str) -> dict[str, ob
         "filename": path.name,
         "path": str(path.resolve(strict=False)),
         "extension": path.suffix.lower(),
-        "source": root.source,
-        "source_root": str(root.path),
         "discovered_at": discovered_at,
         "size": stat_result.st_size,
         "modified_at": datetime.fromtimestamp(stat_result.st_mtime).astimezone().isoformat(),
+        "modified_ns": stat_result.st_mtime_ns,
+        "sources": [{"source": root.source, "root": str(root.path)}],
     }
 
 
-def scan_root(root: RootSpec, extensions: tuple[str, ...], discovered_at: str) -> tuple[list[dict[str, object]], list[ScanDiagnostic]]:
-    records: list[dict[str, object]] = []
+def scan_root(root: RootSpec, extensions: tuple[str, ...], discovered_at: str) -> tuple[list[ExecutableRecord], list[ScanDiagnostic]]:
+    records: list[ExecutableRecord] = []
     diagnostics: list[ScanDiagnostic] = []
     pending = [root.path]
     visited: set[str] = set()
@@ -166,9 +186,29 @@ def scan_root(root: RootSpec, extensions: tuple[str, ...], discovered_at: str) -
     return records, diagnostics
 
 
-def scan_roots(roots: list[RootSpec], extensions: tuple[str, ...], workers: int) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
+def consolidate_records(records: list[ExecutableRecord]) -> list[ExecutableRecord]:
+    merged_records: dict[str, ExecutableRecord] = {}
+    for record in records:
+        existing = merged_records.get(record["id"])
+        if existing is None:
+            merged_records[record["id"]] = record
+            continue
+
+        known_sources = {(source["source"], source["root"]) for source in existing["sources"]}
+        for source in record["sources"]:
+            source_key = (source["source"], source["root"])
+            if source_key not in known_sources:
+                existing["sources"].append(source)
+                known_sources.add(source_key)
+
+    for record in merged_records.values():
+        record["sources"].sort(key=lambda source: (source["source"].casefold(), source["root"].casefold()))
+    return sorted(merged_records.values(), key=lambda record: (record["normalized_name"], record["path"].casefold()))
+
+
+def scan_roots(roots: list[RootSpec], extensions: tuple[str, ...], workers: int) -> tuple[list[ExecutableRecord], list[dict[str, str]]]:
     discovered_at = utc_now()
-    records: list[dict[str, object]] = []
+    records: list[ExecutableRecord] = []
     diagnostics: list[ScanDiagnostic] = []
     worker_count = max(1, min(workers, len(roots) or 1))
 
@@ -179,16 +219,20 @@ def scan_roots(roots: list[RootSpec], extensions: tuple[str, ...], workers: int)
             records.extend(root_records)
             diagnostics.extend(root_diagnostics)
 
-    unique_records = {record["id"]: record for record in records}
-    ordered_records = sorted(unique_records.values(), key=lambda record: (str(record["normalized_name"]), str(record["path"]).casefold()))
+    ordered_records = consolidate_records(records)
     ordered_diagnostics = sorted((asdict(diagnostic) for diagnostic in diagnostics), key=lambda diagnostic: (diagnostic["source"], diagnostic["root"]))
     return ordered_records, ordered_diagnostics
 
 
-def write_catalog(cache_path: Path, records: list[dict[str, object]], diagnostics: list[dict[str, str]]) -> Catalog:
+def write_catalog(
+    cache_path: Path,
+    records: list[ExecutableRecord],
+    diagnostics: list[dict[str, str]],
+    scanned_at: str | None = None,
+) -> Catalog:
     catalog: Catalog = {
         "schema_version": CATALOG_SCHEMA_VERSION,
-        "scanned_at": utc_now(),
+        "scanned_at": scanned_at or utc_now(),
         "records": records,
         "diagnostics": diagnostics,
     }
@@ -201,6 +245,55 @@ def write_catalog(cache_path: Path, records: list[dict[str, object]], diagnostic
     return catalog
 
 
+def migrate_v1_catalog(catalog: dict[str, object]) -> Catalog:
+    legacy_records = catalog.get("records")
+    if not isinstance(legacy_records, list):
+        raise ValueError("catalog v1 has invalid records")
+
+    migrated_records: list[ExecutableRecord] = []
+    for legacy_record in legacy_records:
+        if not isinstance(legacy_record, dict):
+            raise ValueError("catalog v1 contains an invalid record")
+        path = str(legacy_record.get("path", ""))
+        if not path:
+            raise ValueError("catalog v1 contains a record without a path")
+
+        path_object = Path(path)
+        try:
+            modified_ns = path_object.stat().st_mtime_ns
+        except OSError:
+            modified_ns = 0
+
+        name = str(legacy_record.get("name") or path_object.stem)
+        source = str(legacy_record.get("source", "Unknown"))
+        source_root = str(legacy_record.get("source_root", ""))
+        migrated_records.append(
+            {
+                "id": str(legacy_record.get("id") or executable_id(path_object)),
+                "name": name,
+                "normalized_name": str(legacy_record.get("normalized_name") or name.casefold()),
+                "filename": str(legacy_record.get("filename") or path_object.name),
+                "path": path,
+                "extension": str(legacy_record.get("extension") or path_object.suffix.lower()),
+                "discovered_at": str(legacy_record.get("discovered_at") or catalog.get("scanned_at") or utc_now()),
+                "size": int(legacy_record.get("size", 0)),
+                "modified_at": str(legacy_record.get("modified_at", "")),
+                "modified_ns": modified_ns,
+                "sources": [{"source": source, "root": source_root}],
+            }
+        )
+
+    diagnostics = catalog.get("diagnostics", [])
+    if not isinstance(diagnostics, list):
+        diagnostics = []
+    return {
+        "schema_version": CATALOG_SCHEMA_VERSION,
+        "scanned_at": str(catalog.get("scanned_at") or utc_now()),
+        "records": consolidate_records(migrated_records),
+        "diagnostics": cast(list[dict[str, str]], diagnostics),
+    }
+
+
 def load_catalog(cache_path: Path) -> Catalog:
     try:
         with cache_path.open(encoding="utf-8") as cache_file:
@@ -209,28 +302,35 @@ def load_catalog(cache_path: Path) -> Catalog:
         raise ValueError(f"catalog not found: {cache_path}; run 'scan' first") from error
     except json.JSONDecodeError as error:
         raise ValueError(f"catalog is not valid JSON: {cache_path}") from error
+    if catalog.get("schema_version") == 1:
+        migrated_catalog = migrate_v1_catalog(catalog)
+        return write_catalog(
+            cache_path,
+            migrated_catalog["records"],
+            migrated_catalog["diagnostics"],
+            migrated_catalog["scanned_at"],
+        )
     if catalog.get("schema_version") != CATALOG_SCHEMA_VERSION or not isinstance(catalog.get("records"), list):
         raise ValueError(f"catalog has an unsupported schema: {cache_path}")
     return cast(Catalog, catalog)
 
 
-def find_records(records: list[dict[str, object]], query: str, source: str | None, extension: str | None) -> list[dict[str, object]]:
+def find_records(records: list[ExecutableRecord], query: str, source: str | None, extension: str | None) -> list[ExecutableRecord]:
     normalized_query = query.casefold()
     normalized_extension = extension.lower() if extension else None
     matches = []
     for record in records:
-        name = str(record["normalized_name"])
-        if normalized_query not in name:
+        if normalized_query not in record["normalized_name"]:
             continue
-        if source and str(record["source"]).casefold() != source.casefold():
+        if source and not any(provenance["source"].casefold() == source.casefold() for provenance in record["sources"]):
             continue
-        if normalized_extension and str(record["extension"]).lower() != normalized_extension:
+        if normalized_extension and record["extension"].lower() != normalized_extension:
             continue
         matches.append(record)
     return matches
 
 
-def print_records(records: list[dict[str, object]], as_json: bool) -> None:
+def print_records(records: list[ExecutableRecord], as_json: bool) -> None:
     if as_json:
         print(json.dumps(records, indent=2))
         return
@@ -238,7 +338,85 @@ def print_records(records: list[dict[str, object]], as_json: bool) -> None:
         print("No matching executables found.")
         return
     for record in records:
-        print(f"{record['id']}  {record['filename']}  [{record['source']}]\n  {record['path']}")
+        source_names = ", ".join(provenance["source"] for provenance in record["sources"])
+        print(f"{record['id']}  {record['filename']}  [{source_names}]\n  {record['path']}")
+
+
+def record_status(record: ExecutableRecord) -> str:
+    try:
+        stat_result = Path(record["path"]).stat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "inaccessible"
+    if stat_result.st_size != record["size"] or stat_result.st_mtime_ns != record["modified_ns"]:
+        return "changed"
+    return "current"
+
+
+def catalog_quality(records: list[ExecutableRecord]) -> dict[str, object]:
+    grouped_by_name: dict[str, list[ExecutableRecord]] = {}
+    for record in records:
+        grouped_by_name.setdefault(record["normalized_name"], []).append(record)
+
+    multi_source_paths = [
+        {
+            "id": record["id"],
+            "path": record["path"],
+            "sources": record["sources"],
+        }
+        for record in records
+        if len(record["sources"]) > 1
+    ]
+    name_conflicts = []
+    for name, candidates in sorted(grouped_by_name.items()):
+        if len(candidates) < 2:
+            continue
+        wrappers = [candidate["id"] for candidate in candidates if candidate["extension"] in WRAPPER_EXTENSIONS]
+        name_conflicts.append(
+            {
+                "name": name,
+                "record_ids": [candidate["id"] for candidate in candidates],
+                "paths": [candidate["path"] for candidate in candidates],
+                "possible_wrapper_or_shim_ids": wrappers,
+            }
+        )
+    stale_records = [
+        {"id": record["id"], "path": record["path"], "status": status}
+        for record in records
+        if (status := record_status(record)) != "current"
+    ]
+    return {
+        "summary": {
+            "records": len(records),
+            "multi_source_paths": len(multi_source_paths),
+            "name_conflicts": len(name_conflicts),
+            "stale_records": len(stale_records),
+        },
+        "multi_source_paths": multi_source_paths,
+        "name_conflicts": name_conflicts,
+        "stale_records": stale_records,
+    }
+
+
+def print_quality_report(report: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return
+    summary = cast(dict[str, int], report["summary"])
+    print(
+        f"Records: {summary['records']} | Multi-source paths: {summary['multi_source_paths']} | "
+        f"Name conflicts: {summary['name_conflicts']} | Stale: {summary['stale_records']}"
+    )
+    for conflict in cast(list[dict[str, object]], report["name_conflicts"]):
+        print(f"\nName conflict: {conflict['name']}")
+        for path in cast(list[str], conflict["paths"]):
+            print(f"  {path}")
+        wrappers = cast(list[str], conflict["possible_wrapper_or_shim_ids"])
+        if wrappers:
+            print(f"  Possible wrappers/shims: {', '.join(wrappers)}")
+    for stale in cast(list[dict[str, str]], report["stale_records"]):
+        print(f"\n{stale['status'].title()}: {stale['path']}")
 
 
 def refresh_catalog(arguments: argparse.Namespace) -> tuple[Catalog, int]:
@@ -276,7 +454,15 @@ def command_show(arguments: argparse.Namespace) -> int:
     if selected is None:
         print(f"No executable with ID '{arguments.record_id}' in {arguments.cache}.", file=sys.stderr)
         return 1
-    print(json.dumps(selected, indent=2) if arguments.json else "\n".join(f"{key}: {value}" for key, value in selected.items()))
+    details = dict(selected)
+    details["current_status"] = record_status(selected)
+    print(json.dumps(details, indent=2) if arguments.json else "\n".join(f"{key}: {value}" for key, value in details.items()))
+    return 0
+
+
+def command_quality(arguments: argparse.Namespace) -> int:
+    catalog = load_catalog(arguments.cache)
+    print_quality_report(catalog_quality(catalog["records"]), arguments.json)
     return 0
 
 
@@ -305,6 +491,9 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser = subparsers.add_parser("show", help="display details for a catalog record")
     show_parser.add_argument("record_id", help="record ID returned by find")
     show_parser.set_defaults(handler=command_show)
+
+    quality_parser = subparsers.add_parser("quality", help="report catalog collisions, provenance, and stale records")
+    quality_parser.set_defaults(handler=command_quality)
     return parser
 
 
