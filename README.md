@@ -31,7 +31,7 @@ Use `--json` before the command for structured output. `scan` recognizes `.exe`,
 
 The default catalog is written to `%LOCALAPPDATA%\ExecutableManager\catalog.json`. Cache writes use a temporary file followed by replacement, so an interrupted write does not leave partial JSON at the catalog path.
 
-Compatible older catalog schemas are migrated automatically when loaded and rewritten atomically. An unsupported or malformed catalog still produces an actionable error rather than discarding data.
+Compatible older catalog schemas are migrated automatically when loaded and rewritten atomically. Before an upgrade, the original is copied beside the active catalog with a version-and-datetime suffix such as `catalog.v1.20260917T142030123456+0530.json`. An unsupported or malformed catalog still produces an actionable error rather than discarding data.
 
 Directory roots are scanned concurrently with a bounded thread pool. Inaccessible paths are retained as diagnostics in the catalog without preventing results from other roots. Scanning does not change PATH, launch any executable, or install software.
 

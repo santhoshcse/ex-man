@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import sysconfig
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Iterable, TypedDict, cast
+from typing import Callable, Iterable, TypedDict, cast
 
 
 CATALOG_SCHEMA_VERSION = 2
@@ -245,7 +246,7 @@ def write_catalog(
     return catalog
 
 
-def migrate_v1_catalog(catalog: dict[str, object]) -> Catalog:
+def migrate_v1_to_v2(catalog: dict[str, object]) -> dict[str, object]:
     legacy_records = catalog.get("records")
     if not isinstance(legacy_records, list):
         raise ValueError("catalog v1 has invalid records")
@@ -294,6 +295,44 @@ def migrate_v1_catalog(catalog: dict[str, object]) -> Catalog:
     }
 
 
+CatalogMigration = Callable[[dict[str, object]], dict[str, object]]
+CATALOG_MIGRATIONS: dict[int, CatalogMigration] = {
+    1: migrate_v1_to_v2,
+}
+
+
+def backup_catalog(cache_path: Path, schema_version: int) -> Path:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f%z")
+    backup_path = cache_path.with_name(f"{cache_path.stem}.v{schema_version}.{timestamp}{cache_path.suffix}")
+    try:
+        shutil.copy2(cache_path, backup_path)
+    except OSError as error:
+        raise ValueError(f"could not back up catalog before migration: {error}") from error
+    return backup_path
+
+
+def migrate_catalog(catalog: dict[str, object]) -> Catalog:
+    schema_version = catalog.get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise ValueError("catalog has an invalid schema version")
+    if schema_version > CATALOG_SCHEMA_VERSION:
+        raise ValueError(
+            f"catalog schema v{schema_version} is newer than this CLI supports (v{CATALOG_SCHEMA_VERSION})"
+        )
+
+    migrated_catalog = catalog
+    while schema_version < CATALOG_SCHEMA_VERSION:
+        migration = CATALOG_MIGRATIONS.get(schema_version)
+        if migration is None:
+            raise ValueError(f"catalog schema v{schema_version} cannot be migrated automatically")
+        migrated_catalog = migration(migrated_catalog)
+        next_schema_version = migrated_catalog.get("schema_version")
+        if not isinstance(next_schema_version, int) or next_schema_version <= schema_version:
+            raise ValueError(f"catalog migration from v{schema_version} did not advance the schema version")
+        schema_version = next_schema_version
+    return cast(Catalog, migrated_catalog)
+
+
 def load_catalog(cache_path: Path) -> Catalog:
     try:
         with cache_path.open(encoding="utf-8") as cache_file:
@@ -302,15 +341,22 @@ def load_catalog(cache_path: Path) -> Catalog:
         raise ValueError(f"catalog not found: {cache_path}; run 'scan' first") from error
     except json.JSONDecodeError as error:
         raise ValueError(f"catalog is not valid JSON: {cache_path}") from error
-    if catalog.get("schema_version") == 1:
-        migrated_catalog = migrate_v1_catalog(catalog)
-        return write_catalog(
+    schema_version = catalog.get("schema_version")
+    if isinstance(schema_version, int) and not isinstance(schema_version, bool) and schema_version < CATALOG_SCHEMA_VERSION:
+        backup_path = backup_catalog(cache_path, schema_version)
+        migrated_catalog = migrate_catalog(catalog)
+        updated_catalog = write_catalog(
             cache_path,
             migrated_catalog["records"],
             migrated_catalog["diagnostics"],
             migrated_catalog["scanned_at"],
         )
-    if catalog.get("schema_version") != CATALOG_SCHEMA_VERSION or not isinstance(catalog.get("records"), list):
+        print(
+            f"Migrated catalog v{schema_version} to v{CATALOG_SCHEMA_VERSION}; backup: {backup_path}",
+            file=sys.stderr,
+        )
+        return updated_catalog
+    if schema_version != CATALOG_SCHEMA_VERSION or not isinstance(catalog.get("records"), list):
         raise ValueError(f"catalog has an unsupported schema: {cache_path}")
     return cast(Catalog, catalog)
 
