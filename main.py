@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import hashlib
 import json
+import msvcrt
 import os
 import shutil
 import sys
 import sysconfig
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Callable, Iterable, TypedDict, cast
+from typing import BinaryIO, Callable, Iterable, TypedDict, cast
 
 
 CATALOG_SCHEMA_VERSION = 2
@@ -72,6 +75,7 @@ class RootSpec:
 class ScanDiagnostic:
     source: str
     root: str
+    code: str
     message: str
 
 
@@ -173,6 +177,54 @@ def parse_extensions(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(extensions))
 
 
+def non_negative_float(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("timeout must be a non-negative number") from error
+    if timeout < 0:
+        raise argparse.ArgumentTypeError("timeout must be a non-negative number")
+    return timeout
+
+
+class CatalogLock:
+    def __init__(self, catalog_path: Path, timeout: float) -> None:
+        self.lock_path = catalog_path.with_name(f"{catalog_path.name}.lock")
+        self.timeout = timeout
+        self.lock_file: BinaryIO | None = None
+
+    def __enter__(self) -> CatalogLock:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_file = self.lock_path.open("a+b")
+        self.lock_file.seek(0, os.SEEK_END)
+        if self.lock_file.tell() == 0:
+            self.lock_file.write(b"0")
+            self.lock_file.flush()
+
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self.lock_file.seek(0)
+                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return self
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    self.lock_file.close()
+                    self.lock_file = None
+                    raise ValueError(f"timed out waiting for catalog refresh lock: {self.lock_path}") from error
+                time.sleep(0.1)
+
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
+        if self.lock_file is None:
+            return
+        try:
+            self.lock_file.seek(0)
+            msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self.lock_file.close()
+            self.lock_file = None
+
+
 def unique_root_specs(specifications: Iterable[RootSpec]) -> list[RootSpec]:
     seen: set[tuple[str, bool]] = set()
     roots: list[RootSpec] = []
@@ -237,6 +289,18 @@ def build_record(path: Path, root: RootSpec, discovered_at: str) -> ExecutableRe
     }
 
 
+def diagnostic_for_error(root: RootSpec, path: str, error: OSError) -> ScanDiagnostic:
+    if isinstance(error, PermissionError) or error.errno in (errno.EACCES, errno.EPERM):
+        code = "permission-denied"
+    elif error.errno == errno.ENOENT:
+        code = "broken-link" if Path(path).is_symlink() else "unavailable"
+    elif error.errno == errno.ENOTDIR:
+        code = "invalid-path"
+    else:
+        code = "io-error"
+    return ScanDiagnostic(root.source, path, code, str(error))
+
+
 def scan_root(root: RootSpec, extensions: tuple[str, ...], discovered_at: str) -> tuple[list[ExecutableRecord], list[ScanDiagnostic]]:
     records: list[ExecutableRecord] = []
     diagnostics: list[ScanDiagnostic] = []
@@ -261,9 +325,9 @@ def scan_root(root: RootSpec, extensions: tuple[str, ...], discovered_at: str) -
                             if path.suffix.lower() in extensions:
                                 records.append(build_record(path, root, discovered_at))
                     except OSError as error:
-                        diagnostics.append(ScanDiagnostic(root.source, entry.path, str(error)))
+                        diagnostics.append(diagnostic_for_error(root, entry.path, error))
         except OSError as error:
-            diagnostics.append(ScanDiagnostic(root.source, str(directory), str(error)))
+            diagnostics.append(diagnostic_for_error(root, str(directory), error))
 
     return records, diagnostics
 
@@ -476,6 +540,36 @@ def record_status(record: ExecutableRecord) -> str:
     return "current"
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as executable_file:
+        while chunk := executable_file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_record(record: ExecutableRecord, include_hash: bool) -> dict[str, object]:
+    result: dict[str, object] = {
+        "id": record["id"],
+        "path": record["path"],
+        "status": record_status(record),
+    }
+    try:
+        stat_result = Path(record["path"]).stat()
+    except OSError as error:
+        result["error"] = str(error)
+        return result
+
+    result["size"] = stat_result.st_size
+    result["modified_at"] = datetime.fromtimestamp(stat_result.st_mtime).astimezone().isoformat()
+    if include_hash:
+        try:
+            result["sha256"] = sha256_file(Path(record["path"]))
+        except OSError as error:
+            result["hash_error"] = str(error)
+    return result
+
+
 def catalog_quality(records: list[ExecutableRecord]) -> dict[str, object]:
     grouped_by_name: dict[str, list[ExecutableRecord]] = {}
     for record in records:
@@ -563,8 +657,9 @@ def refresh_catalog(arguments: argparse.Namespace) -> tuple[Catalog, int]:
     roots = configured_root_specs(configuration, arguments.root, arguments.no_default_sources)
     workers = arguments.workers if arguments.workers is not None else configuration["workers"]
     extensions = arguments.extensions if arguments.extensions is not None else tuple(configuration["extensions"])
-    records, diagnostics = scan_roots(roots, extensions, workers)
-    catalog = write_catalog(arguments.cache, records, diagnostics)
+    with CatalogLock(arguments.cache, arguments.lock_timeout):
+        records, diagnostics = scan_roots(roots, extensions, workers)
+        catalog = write_catalog(arguments.cache, records, diagnostics)
     return catalog, len(roots)
 
 
@@ -605,6 +700,33 @@ def command_quality(arguments: argparse.Namespace) -> int:
     catalog = load_catalog(arguments.cache)
     print_quality_report(catalog_quality(catalog["records"]), arguments.json)
     return 0
+
+
+def command_verify(arguments: argparse.Namespace) -> int:
+    catalog = load_catalog(arguments.cache)
+    selected_ids = set(arguments.record_id or [])
+    records = catalog["records"]
+    if selected_ids:
+        records = [record for record in records if record["id"] in selected_ids]
+        found_ids = {record["id"] for record in records}
+        missing_ids = sorted(selected_ids - found_ids)
+        if missing_ids:
+            print(f"Unknown catalog record ID(s): {', '.join(missing_ids)}", file=sys.stderr)
+            return 1
+
+    results = [verify_record(record, arguments.hash) for record in records]
+    if arguments.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for result in results:
+            print(f"{result['status']}: {result['path']}")
+            if "sha256" in result:
+                print(f"  sha256: {result['sha256']}")
+            if "error" in result:
+                print(f"  error: {result['error']}")
+            if "hash_error" in result:
+                print(f"  hash error: {result['hash_error']}")
+    return 0 if all(result["status"] == "current" for result in results) else 1
 
 
 def source_report(catalog: Catalog) -> dict[str, object]:
@@ -715,6 +837,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--no-default-sources", action="store_true", help="skip configured built-in source locations")
     scan_parser.add_argument("--workers", type=int, help="maximum scan workers; overrides configuration")
     scan_parser.add_argument("--extensions", type=parse_extensions, help="comma-separated executable extensions; overrides configuration")
+    scan_parser.add_argument("--lock-timeout", type=non_negative_float, default=30.0, help="seconds to wait for another refresh")
     scan_parser.set_defaults(handler=command_scan)
 
     find_parser = subparsers.add_parser("find", help="search the catalog by executable name")
@@ -724,6 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     find_parser.add_argument("--no-default-sources", action="store_true", help="skip configured built-in source locations for --fresh")
     find_parser.add_argument("--workers", type=int, help="maximum scan workers for --fresh; overrides configuration")
     find_parser.add_argument("--extensions", type=parse_extensions, help="extensions for --fresh; overrides configuration")
+    find_parser.add_argument("--lock-timeout", type=non_negative_float, default=30.0, help="seconds to wait for another refresh")
     find_parser.add_argument("--source", help="only search one source label")
     find_parser.add_argument("--extension", help="only search one extension, such as .exe")
     find_parser.set_defaults(handler=command_find)
@@ -734,6 +858,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     quality_parser = subparsers.add_parser("quality", help="report catalog collisions, provenance, and stale records")
     quality_parser.set_defaults(handler=command_quality)
+
+    verify_parser = subparsers.add_parser("verify", help="check catalog records against the current filesystem")
+    verify_parser.add_argument("--record-id", action="append", help="only verify one record ID; repeatable")
+    verify_parser.add_argument("--hash", action="store_true", help="compute SHA-256 for verified files")
+    verify_parser.set_defaults(handler=command_verify)
 
     sources_parser = subparsers.add_parser("sources", help="report catalog source coverage and diagnostics")
     sources_parser.set_defaults(handler=command_sources)

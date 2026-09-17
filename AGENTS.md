@@ -31,6 +31,7 @@ Run the CLI from the repository root:
 - Limit a search to executable files: `python main.py find claude --extension .exe`
 - Inspect a result returned by `find`: `python main.py show RECORD_ID`
 - Review collisions, source provenance, potential wrappers, and stale records: `python main.py quality`
+- Verify live catalog paths: `python main.py verify`; add `--record-id RECORD_ID --hash` for a SHA-256 checksum
 - Create and inspect user configuration: `python main.py config init` and `python main.py config show`
 - Report catalog source coverage: `python main.py sources`
 - Export catalog records: `python main.py export --format csv --output executables.csv`
